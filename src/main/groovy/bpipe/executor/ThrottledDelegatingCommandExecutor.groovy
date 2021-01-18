@@ -7,11 +7,17 @@ import java.nio.file.Path
 import java.util.regex.Matcher
 import java.util.regex.Pattern
 import bpipe.Command;
+import bpipe.CommandProcessor
 import bpipe.Concurrency;
 import bpipe.Config
 import bpipe.Pipeline
 import bpipe.PipelineContext;
 import bpipe.ResourceUnit;
+import bpipe.processors.DockerContainerWrapper
+import bpipe.processors.MemoryLimitReplacer
+import bpipe.processors.SingularityContainerWrapper
+import bpipe.processors.StorageResolver
+import bpipe.processors.ThreadAllocationReplacer
 import bpipe.storage.StorageLayer
 import bpipe.RescheduleResult
 import bpipe.PipelineError
@@ -98,13 +104,10 @@ class ThrottledDelegatingCommandExecutor implements CommandExecutor {
     /**
      * Resolve final variables and invoke the the wrapped / delegated start 
      */
+    @CompileStatic
     void doStart(Map cfg, Command cmd) {
         
-        addMemoryResources(cfg, cmd)
-            
-        String threadAmount = resolveAndConfigureThreadResources(cfg)
-
-        prepareCommand(cmd, threadAmount)
+        prepareCommand(cmd)
 
         Pipeline pipeline = bpipe.Pipeline.currentRuntimePipeline.get()
         pipeline.isIdle = false
@@ -115,31 +118,12 @@ class ThrottledDelegatingCommandExecutor implements CommandExecutor {
         
         synchronized(jobLaunchLock) {
             if(cfg.containsKey('jobLaunchSeparationMs')) {
-                Thread.sleep(cfg.jobLaunchSeparationMs)
+                Thread.sleep((int)cfg.jobLaunchSeparationMs)
             }
             commandExecutor.start(cfg, this.command, outputLog, errorLog)
         }
         
         this.command.save()
-    }
-
-    @CompileStatic
-    private String resolveAndConfigureThreadResources(Map cfg) {
-        ResourceUnit threadResource = resources.find { ResourceUnit ru -> ru.key == "threads" }
-
-        if(isUnlimited(cfg,threadResource))
-            threadResource.amount = ResourceUnit.UNLIMITED
-
-        resources.each { Concurrency.theInstance.acquire(it) }
-
-        int threadCount = threadResource?threadResource.amount:1
-        String threadAmount = String.valueOf(threadCount)
-
-        // Problem: some executors use non-integer values here, if we overwrite with an integer value then
-        // we break them (Sge)
-        if((cfg.procs == null) || cfg.procs.toString().isInteger() || (cfg.procs instanceof IntRange))
-            cfg.procs = threadCount
-        return threadAmount
     }
 
     /**
@@ -156,25 +140,14 @@ class ThrottledDelegatingCommandExecutor implements CommandExecutor {
     }
 
     /**
-     * Substitute the lazy variables in teh command and initialise the 
+     * Substitute the lazy variables in the command and initialise the 
      * execution statistics.
      */
     @CompileStatic
-    private void prepareCommand(Command cmd, String threadAmount) {
+    private void prepareCommand(Command cmd) {
         
-        Pipeline pipeline = bpipe.Pipeline.currentRuntimePipeline.get()
-        
-//        if(cfg.containsKey('storage') && pipeline.branch.hasProperty('region')) {
-//            RegionValue region = (RegionValue) pipeline.branch.getProperty('region')
-//            StorageLayer storage = StorageLayer.create(Config.listValue((String)cfg.storage)[0])
-//            region.storage = storage
-//        }
-        
-//        TODO: match on something like {bpipe:?:/some/path} and replace with the resolved storage value
-//        command.command = command.command.replaceAll(PipelineContext.REGION_LAZY_VALUE, threadAmount)
-        
-        command.command = command.command.replaceAll(PipelineContext.THREAD_LAZY_VALUE, threadAmount)
-        command.command = this.replaceStorageMountPoints(command)
+        runProcessors(cmd)
+
         if(command.@cfg.beforeRun != null) {
             ((Closure)command.@cfg.beforeRun)(cmd.@cfg)
         }
@@ -182,64 +155,38 @@ class ThrottledDelegatingCommandExecutor implements CommandExecutor {
         command.allocated = true
         command.createTimeMs = System.currentTimeMillis()
     }
-    
-    @CompileStatic
-    void addMemoryResources(Map cfg, Command cmd) {
-        
-        if(!cfg.containsKey("memory")) {
-            checkIfMemoryInCommand()
-            return
-        }
-            
-        ResourceUnit memoryResource = ResourceUnit.memory(cfg.memory)
-        int memoryAmountMB = memoryResource.amount
-            
-        if(cfg.containsKey("memoryMargin")) {
-            ResourceUnit memoryMargin = ResourceUnit.memory(cfg.memoryMargin)
-            memoryAmountMB = Math.max((int)(memoryAmountMB/2),(int)(memoryAmountMB-memoryMargin.amount))
-            log.info "After applying memory margin of ${memoryMargin}MB, actual memory available is ${memoryAmountMB}MB"
-        }
-            
-        // Actual memory is passed to pipelines in GB
-        int memoryGigs = (int)Math.round((double)(memoryAmountMB / 1024))
-        String memoryValue = String.valueOf(memoryGigs)
-            
-        log.info "Reserving ${memoryValue} of memory for command due to presence of memory config"
-        command.command = command.command.replaceAll(PipelineContext.MEMORY_LAZY_VALUE, memoryValue)
-        resources << memoryResource
-    }
-    
-    /**
-     * Throws exception with informative error message if $memory was referenced in a command
-     * but was not defined anywhere in configuration.
-     * <p>
-     * <i>Note</i>: this was made a separate method because of IllegalAccessError with @CompileStatic
-     * in addMemoryResources
-     */
-    private void checkIfMemoryInCommand() {
-        if(command.command.contains(PipelineContext.MEMORY_LAZY_VALUE)) 
-            throw new PipelineError("Command in stage $command.name:\n\n" + command.command.replaceAll(PipelineContext.MEMORY_LAZY_VALUE,'\\${memory}') + "\n\ncontains reference to \$memory variable, but no memory is specified for this command in the configuration.\n\n" + 
-                                    "Please add an entry for memory to the configuration of this command in your bpipe.config file")
-    }
-    
-    @CompileStatic
-    boolean isUnlimited(Map cfg, ResourceUnit threadResource) {
-        
-        if(threadResource == null)
-            return false
-        
-        if(!command.command.contains(PipelineContext.THREAD_LAZY_VALUE))
-            return false
-            
-        if((threadResource.amount==0) && (threadResource.maxAmount==0)) 
-            return true
 
-        if(!cfg.containsKey("procs") && (threadResource.amount == 1) && (threadResource.maxAmount == 0))
-            return true
-        else            
-            return false    
+    private runProcessors(Command cmd) {
+        
+        
+        List<CommandProcessor> processors = [
+            new MemoryLimitReplacer(), 
+            new ThreadAllocationReplacer(),
+            new StorageResolver(commandExecutor),
+        ]
+        
+        String containerType = ((Map)cmd.processedConfig.container)?.type
+        log.info "Container type for command $cmd.id is $containerType"
+        if(containerType) {
+            if(containerType == "docker") {
+                log.info "Configuring command with singularity shell wrapper for command $cmd.id"
+                processors << new DockerContainerWrapper()
+            }
+            else
+            if(containerType == "singularity") {
+                log.info "Configuring command with singularity shell wrapper for command $cmd.id"
+                processors << new SingularityContainerWrapper()
+            }
+            else 
+                throw new IllegalArgumentException("Unknown container type $containerType configured")
+        }
+        
+        for(CommandProcessor processor in processors) {
+            processor.transform(cmd, resources)
+        }
     }
     
+  
     /**
      * Wait for the delegate pipeline to stop and then release concurrency permits
      * that were allocated to it
@@ -366,77 +313,4 @@ class ThrottledDelegatingCommandExecutor implements CommandExecutor {
         this.commandExecutor.cleanup()
     }
     
-    final static Pattern MOUNT_POINT_PATTERN = ~/\{bpipe:([a-zA-Z0-9]{1,}):(.*?)\}/
-    
-    final static Pattern REGION_PATTERN = ~/\{region:(.*?)\}/
-    
-    @CompileStatic
-    protected String replaceStorageMountPoints(Command command) {
-        
-        StringBuffer regionCommand = transferBEDsAndReplaceRegionReferences(command.command)
-        
-        log.info "After replacing regions, command is: $regionCommand"
-        
-        Matcher matches = MOUNT_POINT_PATTERN.matcher(regionCommand)
-        StringBuffer newCommand = new StringBuffer(command.command.size())
-        log.info "Checking for mount paths in $command.command"
-        while(matches.find()) {
-            String path = matches.group(2)
-            String storageName = matches.group(1)
-            
-            log.info "Replacement path is $path via storage $storageName"
-            
-            StorageLayer storage = StorageLayer.create(storageName)
-//            String mountedPath = commandExecutor.localPath(storageName)
-            commandExecutor.mountStorage(storage)
-            String mountedPath = commandExecutor.localPath(storageName) // assumption that storage mounts under its own name, not really true
-            log.info "Storage $storageName mounted to path $mountedPath in executor $commandExecutor"
-            
-            // Strip leading slashes as we need to reference this relative to the local path of the mount returned by the executor
-            path = path.replaceAll('^/*','')
-            
-            String newPath = mountedPath ? "$mountedPath/$path" : path
-            matches.appendReplacement(newCommand, newPath)
-        }
-        matches.appendTail(newCommand)
-        
-        
-        log.info "Replacing storage mount points in $command.command => $newCommand"
-        return newCommand
-    }
-
-    /**
-     *  Searches for unresolved region file references in the command and replaces
-     *  them with appropriate paths for the storage system the command is using.
-     *  
-     *  If the storage system is non-local, transfers the BED file so that the 
-     *  remote system will have access to it, and transforms the path to the
-     *  correct path on the other system.
-     * 
-     * @param command
-     * @return  command with region references removed / replaced
-     */
-    @CompileStatic
-    private StringBuffer transferBEDsAndReplaceRegionReferences(final String command) {
-        String defaultStorageName = Config.listValue(cfg, 'storage')[0]
-        StorageLayer defaultStorage = StorageLayer.create(defaultStorageName)
-
-        // First replace the regions, as these will turn into storage mounts?
-        StringBuffer regionCommand = new StringBuffer()
-        Matcher regionMatches = REGION_PATTERN.matcher(command)
-        while(regionMatches.find()) {
-            String localPath = regionMatches.group(1)
-            String mountPoint = commandExecutor.localPath(defaultStorageName)
-            String remotePath = mountPoint ? (mountPoint + '/' + localPath) :  localPath
-            regionMatches.appendReplacement(regionCommand, remotePath)
-            if(defaultStorageName && defaultStorageName != 'local') {
-                Path toPath = defaultStorage.toPath(localPath)
-                log.info "Copying region from $localPath -> $toPath"
-                if(!Files.exists(toPath))
-                    Files.copy(new File(localPath).toPath(), toPath)
-            }
-        }
-        regionMatches.appendTail(regionCommand)
-        return regionCommand
-    }
 }

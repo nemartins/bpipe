@@ -273,13 +273,13 @@ class Utils {
      * return existing collections as is
      */
     @CompileStatic
-    static Collection box(outputs) {
+    static List box(Object outputs) {
         
         if(outputs == null)
             return []
         
         if(outputs instanceof Collection)
-            return (Collection)outputs
+            return outputs as List
         
         if(outputs.class.isArray())    
             return outputs as List
@@ -1277,5 +1277,19 @@ class Utils {
                 Files.setLastModifiedTime(p, now)
             println("MSG: Touching file: $p")
         }
+    }
+    
+    @CompileStatic
+    public static Map configToMap(Map m) {
+        if(m instanceof ConfigObject) {
+            m = m.collectEntries { it }
+        }
+        
+        for(Map.Entry e in m) {
+            if(e.value instanceof Map) {
+                e.value = configToMap((Map)e.value)
+            }
+        }
+        return m
     }
 }

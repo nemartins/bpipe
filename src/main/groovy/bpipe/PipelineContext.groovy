@@ -372,6 +372,8 @@ class PipelineContext {
     */
    private List<PipelineFile> output = null
    
+   boolean annotated = false
+   
    void setOutput(o) {
        setRawOutput(toOutputFolder(o))
    }
@@ -648,7 +650,7 @@ class PipelineContext {
    PipelineOutput getOutputImpl() {
        
        OutputResolver resolver = new OutputResolver()
-       if(resolver.out == null || this.currentFileNameTransform) { // Output not set elsewhere, or set dynamically based on inputs
+       if(resolver.out == null || resolver.out.isEmpty() || this.currentFileNameTransform) { // Output not set elsewhere, or set dynamically based on inputs
            resolver.resolveOutput()
        }
        else {
@@ -1253,6 +1255,7 @@ class PipelineContext {
      *       properly handled in the glob matching
      *       
      */
+    @CompileStatic
     Object produceImpl(Object out, Closure body) { 
         produceImpl(out,body,false)
     }
@@ -1274,7 +1277,7 @@ class PipelineContext {
                 String.valueOf(it)
         }
         
-        List globOutputs = Utils.box(toOutputFolder(Utils.box(out).grep { it instanceof Pattern || it.contains("*") }))
+        List globOutputs = (List)Utils.box(toOutputFolder(Utils.box(out).grep { it instanceof Pattern || ((String)it).contains("*") }))
         
         // Coerce so that files go to the right output folder
         if(explicit) { // User invoked produce directly. In that case, if they put a directory into the produce
@@ -1289,9 +1292,9 @@ class PipelineContext {
         boolean doExecute = true
         
         List fixedOutputs = 
-            Utils.box(out).grep { !(it instanceof Pattern) &&  !it.contains("*") }
+            Utils.box(out).grep { !(it instanceof Pattern) &&  !((String)it).contains("*") }
                           .collect { f ->
-                              new PipelineFile(f, StorageLayer.defaultStorage)
+                              new PipelineFile((String)f, StorageLayer.defaultStorage)
                           } 
         
         // Check for all existing files that match the globs
@@ -1316,167 +1319,178 @@ class PipelineContext {
         StorageLayer associatedStorage = null
         
         try {
-            PipelineDelegate.setDelegateOn(this, body)
-            log.info("Probing command using inputs ${this.@input}")
-            List oldInferredOutputs = this.allInferredOutputs.clone()
-            Exception probeError = null
             try {
-                body()
-            }
-            catch(PipelineError e) {
-                throw e
-            }
-            catch(Exception e) {
-                log.info "Exception occurred during probe: $e.message"
-                Utils.logException log, "Exception during probe: ", e
-                probeFailure = true
-                probeError = e
-            }
-            log.info "Finished probe"
-
-            
-            // For now, treat the last command as the one to associate: this will be possibly confusing
-            // if multiple commands exist with different storage
-            candidateCommandsToAssociate += this.trackedOutputs*.value.sort { -it.id.toInteger()  }[0]
-            associatedCommand = candidateCommandsToAssociate[0]
-            log.info "Tracked commands after probe are: " + this.trackedOutputs*.key.join(',') + " with associated command: " + associatedCommand?.id
-            if(associatedCommand != null) {
-                associatedStorage = resolveStorageForConfig(associatedCommand.getProcessedConfig())
-            }
-            else
-            if(!this.aliases.aliases.isEmpty()) { // can we get storage from an input alias?
-                // For now, we will use just the storage of the first alias
-                // aliasing outputs to inputs derived from multiple different storages 
-                // will cause an issue here
-                log.info "No command: resolving storage via alias"
-                associatedStorage = this.aliases.aliases*.value[0]?.to?.storage
-            }
-            else {
-                // The output file COULD have been created by inline code (even though that
-                // would be discouraged)
-                if(fixedOutputs && fixedOutputs.every { it.exists() }) {
-                    log.warning "Fixed outputs were created by probe: assuming inline code created $fixedOutputs"
-                    associatedStorage = fixedOutputs[0].storage
+                PipelineDelegate.setDelegateOn(this, body)
+                log.info("Probing command using inputs ${this.@input}")
+                List oldInferredOutputs = (List) this.allInferredOutputs.clone()
+                Exception probeError = null
+                try {
+                    body()
                 }
-            }
-           
-            if(associatedStorage==null && probeFailure) {
-                println "WARNING: An error occurred evaluating your pipeline stage: $probeError. Please see Bpipe log file for full details."
-                associatedStorage = StorageLayer.defaultStorage
-            }
-            else
-                assert associatedStorage != null : "Unable to find any storage to associate to outputs: (fixed outputs: $fixedOutputs, associatedCommand=$associatedCommand, stage = $stageName)"
-            
-            // Set the storage on any glob outputs that need it
-            globExistingFiles*.setStorage(associatedStorage)
-            
-            this.pendingGlobOutputs += globExistingFiles
-
-            List<PipelineFile> probeResolvedInputs = getResolvedInputs()
-            
-            // Update transformed inputs if a different input was selected
-            // than was expected by default
-            retransformOutputs(lastInputs, probeResolvedInputs, fixedOutputs)
-            
-            List<PipelineFile> allInputs = (probeResolvedInputs  + Utils.box(lastInputs)).unique()
-            
-            // Associate storage to any outputs that did not resolve storage already
-            fixedOutputs = fixedOutputs.collect { o ->
-                if(o instanceof UnknownStoragePipelineFile)
-                    new PipelineFile(o.path, associatedStorage) 
-                else
-                    o
-            }
-
-            List<PipelineFile> outputsToCheck = fixedOutputs.clone()
-            List newInferredOutputs = this.allInferredOutputs.clone()
-            newInferredOutputs.removeAll(oldInferredOutputs)
-			
-			List<PipelineFile> newInferredOutputFiles = resolvePipelineFiles(newInferredOutputs)
-            outputsToCheck.addAll(newInferredOutputFiles)
-
-            // In some cases the user may specify an output explicitly with a direct produce(...)
-            // but then not reference that output variable at all in any of their
-            // commands. In such a case the command should still execute, even though the command
-            // would seem not to create the output - if we can't see any other way the output
-            // is going to get created, we infer that the command is going to create it "magically"
-            // see produce_and_output_function_no_output_ref test.
-            for(def o in fixedOutputs) {
-                if(explicit && !trackedOutputs.containsKey(o) && !inferredOutputs.contains(o)) {
-                    this.internalOutputs.add(o)
+                catch(PipelineError e) {
+                    throw e
                 }
-            }
-            
+                catch(Exception e) {
+                    log.info "Exception occurred during probe: $e.message"
+                    Utils.logException log, "Exception during probe: ", e
+                    probeFailure = true
+                    probeError = e
+                }
+                log.info "Finished probe"
 
-            log.info "Checking " + (outputsToCheck + globExistingFiles)
-            if(probeFailure) {
-                log.info "Not up to date because probe failed"
-            }
-            else {
-                List<PipelineFile> unaliasedInputs = allInputs.collect { aliases[it] }
-                List<PipelineFile> outOfDateOutputs = Dependencies.instance.getOutOfDate(outputsToCheck + globExistingFiles, unaliasedInputs)
-                if(outOfDateOutputs) {
-                    log.info "Not up to date because input inferred by probe of body newer than outputs"
-                    if(Runner.touchMode) {
-                        doExecute = false
-                        Utils.touchPaths(outOfDateOutputs)
-                    }
+                
+                // For now, treat the last command as the one to associate: this will be possibly confusing
+                // if multiple commands exist with different storage
+                candidateCommandsToAssociate += this.trackedOutputs*.value.sort { -it.id.toInteger()  }[0]
+                associatedCommand = candidateCommandsToAssociate[0]
+                log.info "Tracked commands after probe are: " + this.trackedOutputs*.key.join(',') + " with associated command: " + associatedCommand?.id
+                if(associatedCommand != null) {
+                    associatedStorage = resolveStorageForConfig(associatedCommand.getProcessedConfig())
                 }
                 else
-                if(!Config.config.enableCommandTracking || !checkForModifiedCommands()) {
-                    msg("Skipping steps to create ${Utils.box(out).unique()} because " + (lastInputs?"newer than $lastInputs" : " file already exists"))
-                    log.info "Skipping produce body"
-                    doExecute = false
+                if(!this.aliases.aliases.isEmpty()) { // can we get storage from an input alias?
+                    // For now, we will use just the storage of the first alias
+                    // aliasing outputs to inputs derived from multiple different storages 
+                    // will cause an issue here
+                    log.info "No command: resolving storage via alias"
+                    associatedStorage = this.aliases.aliases*.value[0]?.to?.storage
                 }
                 else {
-                    log.info "Not skipping because of modified command"
+                    // The output file COULD have been created by inline code (even though that
+                    // would be discouraged)
+                    if(fixedOutputs && fixedOutputs.every { it.exists() }) {
+                        log.warning "Fixed outputs were created by probe: assuming inline code created $fixedOutputs"
+                        associatedStorage = fixedOutputs[0].storage
+                    }
+                }
+               
+                if(associatedStorage==null && probeFailure) {
+                    println "WARNING: An error occurred evaluating your pipeline stage: $probeError. Please see Bpipe log file for full details."
+                    associatedStorage = StorageLayer.defaultStorage
+                }
+                else {
+                    if(annotated && associatedCommand.is(null)) {
+                        log.info "Stage $stageName did not appear to execute a command : clearing outputs and terminating produce early because it was executed implicitly via annotation"
+                        this.@output?.clear()
+                        return
+                    }
+                    assert associatedStorage != null : "Unable to find any storage to associate to outputs: (fixed outputs: $fixedOutputs, associatedCommand=$associatedCommand, stage = $stageName)"
+                }
+                
+                // Set the storage on any glob outputs that need it
+                globExistingFiles*.setStorage(associatedStorage)
+                
+                this.pendingGlobOutputs += globExistingFiles
+
+                List<PipelineFile> probeResolvedInputs = getResolvedInputs()
+                
+                // Update transformed inputs if a different input was selected
+                // than was expected by default
+                retransformOutputs(lastInputs, probeResolvedInputs, fixedOutputs)
+                
+                List<PipelineFile> allInputs = (probeResolvedInputs  + Utils.box(lastInputs)).unique()
+                
+                // Associate storage to any outputs that did not resolve storage already
+                fixedOutputs = fixedOutputs.collect { o ->
+                    if(o instanceof UnknownStoragePipelineFile)
+                        new PipelineFile(o.path, associatedStorage) 
+                    else
+                        o
+                }
+
+                List<PipelineFile> outputsToCheck = fixedOutputs.clone()
+                List newInferredOutputs = this.allInferredOutputs.clone()
+                newInferredOutputs.removeAll(oldInferredOutputs)
+                
+                List<PipelineFile> newInferredOutputFiles = resolvePipelineFiles(newInferredOutputs)
+                outputsToCheck.addAll(newInferredOutputFiles)
+
+                // In some cases the user may specify an output explicitly with a direct produce(...)
+                // but then not reference that output variable at all in any of their
+                // commands. In such a case the command should still execute, even though the command
+                // would seem not to create the output - if we can't see any other way the output
+                // is going to get created, we infer that the command is going to create it "magically"
+                // see produce_and_output_function_no_output_ref test.
+                for(def o in fixedOutputs) {
+                    if(explicit && !trackedOutputs.containsKey(o) && !inferredOutputs.contains(o)) {
+                        this.internalOutputs.add(o)
+                    }
+                }
+                
+
+                log.info "Checking " + (outputsToCheck + globExistingFiles)
+                if(probeFailure) {
+                    log.info "Not up to date because probe failed"
+                }
+                else {
+                    List<PipelineFile> unaliasedInputs = allInputs.collect { aliases[it] }
+                    List<PipelineFile> outOfDateOutputs = Dependencies.instance.getOutOfDate(outputsToCheck + globExistingFiles, unaliasedInputs)
+                    if(outOfDateOutputs) {
+                        log.info "Not up to date because input inferred by probe of body newer than outputs"
+                        if(Runner.touchMode) {
+                            doExecute = false
+                            Utils.touchPaths(outOfDateOutputs)
+                        }
+                    }
+                    else
+                    if(!Config.config.enableCommandTracking || !checkForModifiedCommands()) {
+                        msg("Skipping steps to create ${Utils.box(out).unique()} because " + (lastInputs?"newer than $lastInputs" : " file already exists"))
+                        log.info "Skipping produce body"
+                        doExecute = false
+                    }
+                    else {
+                        log.info "Not skipping because of modified command"
+                    }
                 }
             }
+            finally {
+                this.probeMode = oldProbeMode
+            }
+            
+            List boxedOutputs = Utils.box(this.@output)
+            
+            // If resuming, the command may actually be running
+            // In that case we want to wait for it and then skip if it executed
+            if(Config.config.mode == "resume") {
+                doExecute = waitForResumableOutputs(boxedOutputs)
+            }
+            
+            if(boxedOutputs) {
+                List<PipelineFile> globActualFiles = globExistingFiles*.toPipelineFiles().flatten()
+                this.setRawOutput(
+                    (fixedOutputs  + globActualFiles).unique { it.path }
+                )
+                this.removeReplacedOutputs()
+            }
+            else {
+                this.setRawOutput(fixedOutputs)
+            }
+            
+            if(doExecute) {
+                 
+                DirtyFileManager.instance.add(this.output)
+                
+                PipelineDelegate.setDelegateOn(this, body)
+                log.info("Producing " + this.@output + " from inputs ${this.@input} (output dir=$outputDirectory)")
+                body()
+            }
+            
+            log.info "Adding outputs " + this.@output + " as a result of produce"
+           
+            associateOutputsToProduce()
+
+            associateGlobsToCommandAndAssignOutputs(associatedStorage, globOutputs, associatedCommand)
+            return out
         }
         finally {
-            this.probeMode = oldProbeMode
+            endProduce()
         }
-        
-        List boxedOutputs = Utils.box(this.@output)
-        
-        // If resuming, the command may actually be running
-        // In that case we want to wait for it and then skip if it executed
-        if(Config.config.mode == "resume") {
-            doExecute = waitForResumableOutputs(boxedOutputs)
-        }
-        
-        if(boxedOutputs) {
-			List<PipelineFile> globActualFiles = globExistingFiles*.toPipelineFiles().flatten()
-            this.setRawOutput(
-                (fixedOutputs  + globActualFiles).unique { it.path }
-            )
-            this.removeReplacedOutputs()
-        }
-        else {
-            this.setRawOutput(fixedOutputs)
-        }
-        
-        if(doExecute) {
-             
-            DirtyFileManager.instance.add(this.output)
-            
-            PipelineDelegate.setDelegateOn(this, body)
-            log.info("Producing " + this.@output + " from inputs ${this.@input} (output dir=$outputDirectory)")
-            body()
-        }
-        
-        log.info "Adding outputs " + this.@output + " as a result of produce"
-       
-        associateOutputsToProduce()
+    }
 
-        associateGlobsToCommandAndAssignOutputs(associatedStorage, globOutputs, associatedCommand)
-        
+    private void endProduce() {
         this.currentFileNameTransform = null
-
         this.inputResets.each { it() }
         this.inputResets = []
-        
-        return out
     }
 
     /**
@@ -1790,6 +1804,23 @@ class PipelineContext {
         }
     }
     
+    @CompileStatic
+    void exec(GString cmd) {
+        checkAndClearImplicits(cmd)
+        exec(cmd, true)
+    }
+    
+    /**
+     * @see #exec(String, boolean, String)
+     * @param cmd
+     * @param config
+     */
+    @CompileStatic
+    void exec(GString cmd, String config) {
+        checkAndClearImplicits(cmd)
+        exec(cmd, true, config)
+    }
+    
     /**
      * @see #exec(String, boolean, String)
      * @param cmd
@@ -1807,6 +1838,33 @@ class PipelineContext {
     @CompileStatic
     void exec(String cmd) {
         exec(cmd, true)
+    }
+    
+    List<ImplicitVariable> implicitVariables = []
+    
+   
+    @CompileStatic
+    void checkAndClearImplicits(final GString cmd = null) {
+        if(!cmd.is(null)) {
+            for(Object value in cmd.values) {
+                if((value instanceof String) && (((String)value).size() > 0)) {
+                    String implicitValue = value.toString().substring(1)
+                    implicitVariables.removeAll { ImplicitVariable v -> 
+                        v.name == implicitValue 
+                    }
+                }
+            }
+        }
+        
+       if(implicitVariables) {
+           Exception e = implicitVariables[0].exception
+
+           e.stackTrace = e.stackTrace.grep { StackTraceElement el ->
+               !el.className.startsWith('bpipe.')
+           } as StackTraceElement[]
+
+           throw implicitVariables[0].exception
+       }
     }
     
     /**
@@ -1922,7 +1980,11 @@ class PipelineContext {
             this.echoWhenNotFound = true
             log.info("Entering echo mode on context " + this.hashCode())
             String rTempDir = Utils.createTempDir().absolutePath
-            String scr = c()
+            def scr = c()
+            if(scr instanceof GString) {
+                this.checkAndClearImplicits(scr)
+            }
+
             rCommand = execImpl("""unset TMP; unset TEMP; TEMPDIR="$rTempDir" $setSid $rscriptExe - <<'!'
             $scr
 !
@@ -1937,7 +1999,7 @@ class PipelineContext {
     }
     
     void python(String pythonCommand) {
-        String python = resolveExe("python","python")
+        String python = Utils.resolveExe("python","python")
         exec("""
         $python <<!
         $pythonCommand
@@ -1959,7 +2021,7 @@ class PipelineContext {
     void sqlite(def db, String sqlCommand, String config = null) {
         
         String setSid = Utils.isLinux() ? " setsid " : ""
-        String sqliteCommand = resolveExe("sqlite","sqlite3")
+        String sqliteCommand = Utils.resolveExe("sqlite","sqlite3")
         exec("""
         $setSid $sqliteCommand $db <<!
         $sqlCommand
@@ -2201,12 +2263,7 @@ class PipelineContext {
         }
     }
     
-    /**
-     * Regular expression for identifying string matching a range of integers,
-     * eg: 10 - 30
-     */
-    final static Pattern INT_RANGE_PATTERN = ~/([0-9]*) *- *([0-9]*)$/
-     
+    
     /**
      * Asynchronously executes the given command by creating a CommandExecutor
      * and starting the command using it.  The exit code is not checked and
@@ -2216,10 +2273,10 @@ class PipelineContext {
      * @param deferred      If true, the command will not actually be started until
      *                      the waitFor() method is called
      */
-    Command async(String cmd, boolean joinNewLines=true, String config = null, boolean deferred=false) {
+    Command async(String cmd, boolean joinNewLines=true, String configName = null, boolean deferred=false) {
         
-      if(config == null)
-          config = this.defaultConfig
+      if(configName == null)
+          configName = this.defaultConfig
           
       def joined = ""
       if(joinNewLines) {
@@ -2231,14 +2288,14 @@ class PipelineContext {
       // note - set the command here, so that it can be used to resolve
       // the right configuration. However we set it again below
       // after we have resolved the right thread / procs value
-      Command command = new Command(command:joined, configName:config)
+      Command command = new Command(command:joined, configName:configName)
       
       this.inferUsedProcs(command)
 
       // Inferred outputs are outputs that are picked up through the user's use of 
       // $ouput.<ext> form in their commands. These are intercepted at string evaluation time
       // (prior to the async or exec command entry) and set as inferredOutputs until
-      // the command is executed, and then we wipe them out
+      // the command is executed, and then we reset them
       List unconvertedOutputs = (this.inferredOutputs + this.referencedOutputs + this.internalOutputs + this.pendingGlobOutputs).unique()
       List<PipelineFile> checkOutputs = convertToPipelineFiles(command, unconvertedOutputs)
       
@@ -2288,7 +2345,7 @@ class PipelineContext {
       command.stageId = this.pipelineStages[-1].id
       
       try {
-          command = commandManager.start(stageName, command, config, Utils.box(this.input), 
+          command = commandManager.start(stageName, command, configName, Utils.box(this.input), 
                                          this.usedResources,
                                          deferred, this.outputLog)
  
@@ -2375,47 +2432,53 @@ class PipelineContext {
     }
     
     /**
+     * Regular expression for identifying string matching a range of integers,
+     * eg: 10 - 30
+     */
+    final static Pattern INT_RANGE_PATTERN = ~/([0-9]*) *- *([0-9]*)$/
+
+     /**
      * Inspect the given command to figure out the actual procs it will use by combining
      * the configured procs from bpipe.config with any configured resources by the 
      * use(...) statement or other means.
-     * 
-     * TODO: it is not clear to me this is actually used any more. 
-     * 
+     * <p>
+     * Note the resources use the term "threads" while the config name is "procs"
      * @param command
      */
+    @CompileStatic
     void inferUsedProcs(Command command) {
-      // Work out how many threads to request
-      String actualThreads = this.usedResources['threads'].amount as String  
-      
+
       // If the config itself specifies procs, it should override the auto-thread magic variable
       // which may get given a crazy high number of threads
       def commandCfg = command.getConfig(Utils.box(this.resolvedInputs))
-      if(commandCfg.containsKey('procs')) {
-          def procs = commandCfg.procs
-          int maxProcs = 0
-          if(procs instanceof String) {
-             // Allow range of integers
-             Matcher intRangeMatch = INT_RANGE_PATTERN.matcher(procs)
-             if(intRangeMatch) {
-                 procs = intRangeMatch[0][1].toInteger()
-                 maxProcs = intRangeMatch[0][2].toInteger()
-             }
-             else {
-                 // NOTE: currently SGE is using a procs option like
-                 // 'orte 3' for 3 processes. This here is a hack to enable
-                 // that not to fail, but we need to think about how to handle that better
-                 procs = procs.trim().replaceAll('[^0-9]','').toInteger()
-             }
-          }
-          else
-          if(procs instanceof IntRange) {
-              maxProcs = procs.to
-              procs = procs.from
-          }
-          log.info "Found procs value $procs (maxProcs = $maxProcs) to override computed threads value of $actualThreads"
-          this.usedResources['threads'].amount = procs
-          this.usedResources['threads'].maxAmount = maxProcs
+      if(!commandCfg.containsKey('procs'))
+          return
+          
+      def procs = commandCfg.procs
+      int maxProcs = 0
+      if(procs instanceof String) {
+         // Allow range of integers
+         Matcher intRangeMatch = INT_RANGE_PATTERN.matcher(procs)
+         if(intRangeMatch.find()) {
+             procs = intRangeMatch.group(1).toInteger()
+             maxProcs = intRangeMatch.group(2).toInteger()
+         }
+         else {
+             // NOTE: currently SGE is using a procs option like
+             // 'orte 3' for 3 processes. This here is a hack to enable
+             // that not to fail, but we need to think about how to handle that better
+             procs = ((String)procs).trim().replaceAll('[^0-9]','').toInteger()
+         }
       }
+      else
+      if(procs instanceof IntRange) {
+          maxProcs = ((IntRange)procs).to
+          procs = ((IntRange)procs).from
+      }
+
+      log.info "Found procs value $procs (maxProcs = $maxProcs) to override computed threads value of ${usedResources['threads'].amount}"
+      this.usedResources['threads'].amount = (int)procs
+      this.usedResources['threads'].maxAmount = maxProcs
     }
     
     /**
@@ -2517,13 +2580,14 @@ class PipelineContext {
            exts = exts.tail()
 	   }
        
-       log.info "From clause searching for inputs matching spec $exts"
-       
+        log.info "From clause searching for inputs matching spec $exts"
+        
        if(!exts || exts.every { it == null })
            throw new PipelineError("A call to 'from' was invoked with an empty or null argument. From requires a list of file patterns to match.")
        
-       def orig = exts
+       exts = exts.grep { it != null }
        
+       def orig = exts
       
        exts = Utils.box(exts).collect { (it instanceof PipelineOutput || it instanceof PipelineInput) ? it.toString() : it }
      
