@@ -7,6 +7,7 @@ import bpipe.worx.JMSWorxConnection
 import bpipe.worx.WorxConnection
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
+import groovy.transform.CompileStatic
 import groovy.util.logging.Log
 
 import javax.jms.BytesMessage
@@ -21,6 +22,7 @@ import javax.jms.TextMessage
 import org.apache.activemq.ActiveMQConnectionFactory
 
 @Log
+@CompileStatic
 class JMSAgent extends Agent {
     
     final static long MESSAGE_WAIT_TIMEOUT_MS = 30000
@@ -108,7 +110,7 @@ class JMSAgent extends Agent {
         
         String text
         if(message instanceof TextMessage)
-            text = message.text
+            text = ((TextMessage)message).text
         else
         if(message instanceof BytesMessage) {
             BytesMessage bm = (BytesMessage)message
@@ -131,30 +133,38 @@ class JMSAgent extends Agent {
             return
         }            
         
-        Map commandAttributes = new JsonSlurper().parseText(text)
+        Map commandAttributes = (Map)new JsonSlurper().parseText(text)
         
         if(config.containsKey('transform')) {
-            commandAttributes = config.transform(commandAttributes)
+            commandAttributes = ((Closure)config.transform)(commandAttributes)
         }
         
         log.info "Processing command: " + commandAttributes
         AgentCommandRunner runner = this.processCommand(commandAttributes)
         
-        if(message.getJMSReplyTo() || message.getStringProperty('reply-to')) {
+        if(message.getJMSReplyTo() || message.getStringProperty('reply-to') || message.getStringProperty('replyTo')) {
             log.info "ReplyTo set on message: will send message when complete"
-            runner.completionListener = { result ->
+            runner.completionListener = { Map result ->
                 log.info "Sending reply for command $commandAttributes.id"
                 
                 BpipeCommand command = runner.command
-                Map resultDetails = [
+                
+                log.info "Loading checks from $command.dir "
+                        
+                def checks = bpipe.Check.loadAll(new File(command.dir, '.bpipe/checks'))
+        
+                Map<String,Object> resultDetails = (Map<String,Object>)[
                         command: commandAttributes,
-                        result: result
+                        result: result + [ 
+                            checks:  checks.collect { [name: it.name, stage: it.stage, branch: it.branch, message: it.message, passed: it.passed] }
+                        ]
                 ]
                 
                 if(command instanceof RunPipelineCommand) {
-                    resultDetails.directory = command.runDirectory?.canonicalPath
+                    String runDir = ((RunPipelineCommand)command).runDirectory?.canonicalPath
+                    resultDetails['directory'] = runDir
                 }
-                sendReply(message, JsonOutput.prettyPrint(JsonOutput.toJson(resultDetails )))
+                sendReply(message, JsonOutput.prettyPrint(JsonOutput.toJson(resultDetails)))
             }
         }
         
@@ -171,7 +181,11 @@ class JMSAgent extends Agent {
     private void sendReply(Message tm, String responseJSON) {
         Destination dest = tm.getJMSReplyTo()
         if(dest == null)
-            dest = session.createQueue(tm.getStringProperty('reply-to'))
+            if(tm.getStringProperty('reply-to'))
+                dest = session.createQueue(tm.getStringProperty('reply-to'))
+
+        if(dest == null)
+            dest = session.createQueue(tm.getStringProperty('replyTo'))
 
         TextMessage response = session.createTextMessage(responseJSON)
         MessageProducer producer = session.createProducer(dest)
@@ -228,10 +242,10 @@ class JMSAgent extends Agent {
             
         log.info "Connecting to: ${config.brokerURL}"
             
-        this.connection = new ActiveMQConnectionFactory(brokerURL: config.brokerURL).createConnection()
+        this.connection = new ActiveMQConnectionFactory((String)config.brokerURL).createConnection()
         this.connection.start()        
         this.session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE)
-        this.queue = session.createQueue(config.commandQueue)
+        this.queue = session.createQueue((String)config.commandQueue)
         this.consumer = session.createConsumer(queue)
         
         log.info "Connected to ActiveMQ $config.commandQueue @ $config.brokerURL"
@@ -239,8 +253,8 @@ class JMSAgent extends Agent {
 
     @Override
     public WorxConnection createConnection() {
-        if(config.containsKey('responseQueue')) {
-            Queue queue = this.session.createQueue(config.responseQueue)
+        if(config.getOrDefault('responseQueue', false)) {
+            Queue queue = this.session.createQueue((String)config.responseQueue)
             return new JMSWorxConnection(queue, session)
         }
         else {

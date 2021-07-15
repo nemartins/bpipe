@@ -118,6 +118,37 @@ class PipelineCategory {
         sequentially(list,c)
     }
     
+    @CompileStatic
+    static Closure when(Closure target, Closure condition) {
+        Pipeline.currentUnderConstructionPipeline.joiners.add(condition)
+        def result = { input1 ->
+            Pipeline pipeline = Pipeline.currentRuntimePipeline.get()
+            PipelineContext conditionContext = pipeline.createContext()
+            PipelineDelegate.setDelegateOn(conditionContext,condition)
+
+            def result = condition()
+            if(result) {
+                PipelineStage currentStage = new PipelineStage(pipeline.createContext(), target)
+                pipeline.addStage(currentStage)
+                currentStage.context.setInput(input1)
+                currentStage.run()
+                return currentStage.context.nextInputs?:currentStage.context.@output
+            }
+            else {
+                Branch branch = pipeline.branch
+                if(branch?.toString())
+                    println "======> Skipping stage ${closureNames[target]} in branch $branch"
+                else
+                    println "======> Skipping stage ${closureNames[target]}"
+
+                return null
+            }
+        }
+        Pipeline.currentUnderConstructionPipeline.joiners.add(result)
+        closureNames[result] = closureNames[target]
+        return result
+    }
+    
     static Closure sequentially(List list, Closure c) {
         List nameSetters = []
         Closure result = list.collect { n -> 
@@ -320,7 +351,8 @@ class PipelineCategory {
         multiply(objs, segments, null)
     }
 
-    static Object multiply(Set objs, List segments, List channels) {
+    @CompileStatic
+    static Object multiply(Set objs, List<Closure> segments, List channels) {
         
         Pipeline pipeline = Pipeline.currentUnderConstructionPipeline
         
@@ -340,7 +372,7 @@ class PipelineCategory {
             
             if(!objs) {
                 if(parent.branch?.name && parent.branch.name != "all") {
-                    println "MSG: Parallel segment inside branch $branch.name will not execute because the list to parallelise over is empty"
+                    println "MSG: Parallel segment inside branch $parent.branch.name will not execute because the list to parallelise over is empty"
                 }
                 else {
                     println "MSG: Parallel segment will not execute because the list to parallelise over is empty"
@@ -370,7 +402,8 @@ class PipelineCategory {
                 String forkId = null
                 chrs.each { chr ->
                     
-                    if(!Config.config.branchFilter.isEmpty() && !Config.config.branchFilter.contains(chr)) {
+                    List branchFilter = Config.listValue(Config.config,'branchFilter')
+                    if(branchFilter && !branchFilter.contains(chr)) {
                         System.out.println "Skipping branch $chr because not in branch filter ${Config.config.branchFilter}"
                         return
                     }
@@ -389,11 +422,11 @@ class PipelineCategory {
                         try {
                             
                             // If the filterInputs option is set, match input files on the region name
-                            def childInputs = input
+                            List<PipelineFile> childInputs = (List<PipelineFile>)input
                             
                             child.branch = new Branch()
                             if(chr instanceof Chr) {
-                                childInputs = initChildFromChr(child,chr,input)
+                                childInputs = initChildFromChr(child,chr,childInputs)
                                 if(childInputs == null)
                                     return
                             }
@@ -412,7 +445,7 @@ class PipelineCategory {
                         catch(Exception e) {
                             log.log(Level.SEVERE,"Pipeline segment in thread " + Thread.currentThread().name + " failed with internal error: " + e.message, e)
                             Runner.reportExceptionToUser(e)
-                            Concurrency.instance.unregisterResourceRequestor(child)
+                            Concurrency.theInstance.unregisterResourceRequestor(child)
                             child.failed = true
                         }
                     } as Runnable
@@ -478,7 +511,7 @@ class PipelineCategory {
      * @param chr
      * @return a list of inputs to use for the child, or null if the child should not execute
      */
-    static def initChildFromChr(Pipeline child, Chr chr, List<PipelineFile> input) {
+    static List<PipelineFile> initChildFromChr(Pipeline child, Chr chr, List<PipelineFile> input) {
         
         List<PipelineFile> childInputs = input 
         if(childInputs == null)
@@ -777,15 +810,14 @@ class PipelineCategory {
      * @param current
      * @param pipelines
      */
-    private static void throwCombinedParallelError(Pipeline current, List pipelines) {
+    private static void throwCombinedParallelError(Pipeline current, List<Pipeline> pipelines) {
+
         def messages = summarizeErrors(pipelines)
 
-        for(Pipeline p in pipelines.grep { it.failed }) {
-            // current.failExceptions.addAll(p.failExceptions)
-        }
-        current.failReason = messages
+        // If the fail reason already exists, added to it
+        current.failReason = (current.failReason ? (current.failReason + '\n\n' + messages) : messages)
 
-        List<PipelineError> childFailures = pipelines.grep { it.failed }*.failExceptions.flatten()
+        List<PipelineError> childFailures = pipelines.findAll { Pipeline p -> p.failed }*.failExceptions.flatten()
 
         Exception e
         if(pipelines.every { p -> p.failExceptions.every { it instanceof PipelineTestAbort } }) {

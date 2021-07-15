@@ -24,6 +24,8 @@
  */
 package bpipe
 
+import groovy.json.JsonGenerator
+import groovy.json.JsonOutput
 import groovy.time.TimeCategory;
 
 import groovy.transform.CompileStatic;
@@ -187,6 +189,11 @@ class Utils {
     }
     
     @CompileStatic
+    static boolean fileExists(String o) {
+        fileExists(new File(o))
+    }
+
+    @CompileStatic
     static boolean fileExists(PipelineOutput o) {
         fileExists(new File(o.toString()))
     }
@@ -212,18 +219,21 @@ class Utils {
     }
     
     /**
-     * Attempt to delete all of the specified outputs, if any
+     * Attempt to move all of the specified outputs to trash, if any,
+     * including appropriate audit trail logging and / or warnings to 
+     * console
      * 
      * @param outputs   string or collection of strings representing 
      *                  names of files to be deleted
      * @return List of outputs that could not be cleaned up
      */
+    @CompileStatic
     static List<String> cleanup(def outputs) {
         if(!outputs)
             return
             
         List<String> failed = []
-        box(outputs).collect { new File(it) }.each { File f -> 
+        box(outputs).collect { new File(String.valueOf(it)) }.each { File f -> 
             
             if(!fileExists(f)) {
                 log.info "Not cleaning up file $f because it does not exist"
@@ -750,40 +760,52 @@ class Utils {
     * Coerce all of the arguments to point to files in the specified directory.
     */
     @CompileStatic
-    static List toDir(List outputs, dir) {
+    static List toDir(List outputs, String dir) {
         
        String targetDir = dir
        File targetDirFile = new File(targetDir)
        if(!targetDirFile.exists())
            targetDirFile.mkdirs()
            
-       String outPrefix = targetDir == "." ? "" : targetDir + "/" 
-       
        List<Class> types = outputs.collect { it.class }
        def newOutputs = outputs.collect { out ->
-           Class type = out.class
-           
-           String outString = out.toString()
-           if(outString.contains("/") && outString.contains("*")) 
-               return out
-           else
-           if(out instanceof PipelineFile) {
-               PipelineFile pf = (PipelineFile)out
-               String newPath = targetDir == "." ? pf.name : targetDir + '/' + pf.name
-               return pf.newName(newPath)
-           }
-           else
-           if(outString.contains("/") && new File(outString).exists())  {
-               return out
-           }
-           else {
-             def result = outPrefix + new File(out.toString()).name 
-             return type == Pattern ? Pattern.compile(result) : result
-           }
+           fileToDir(out, dir, false)
        }
-       
        return newOutputs
     }
+    
+    @CompileStatic
+    static def fileToDir(def fileLike, String dir, boolean create=true) {
+        
+       if(create) {
+           File targetDirFile = new File(dir)
+           if(!targetDirFile.exists())
+               targetDirFile.mkdirs()
+       }
+        
+       String fileLikePrefix = dir == "." ? "" : dir + "/" 
+         
+       Class type = fileLike.class
+       
+       String fileLikeString = fileLike.toString()
+       if(fileLikeString.contains("/") && fileLikeString.contains("*")) 
+           return fileLike
+       else
+       if(fileLike instanceof PipelineFile) {
+           PipelineFile pf = (PipelineFile)fileLike
+           String newPath = dir == "." ? pf.name : dir + '/' + pf.name
+           return pf.newName(newPath)
+       }
+       else
+       if(fileLikeString.contains("/") && new File(fileLikeString).exists())  {
+           return fileLike
+       }
+       else {
+         def result = fileLikePrefix + new File(fileLike.toString()).name 
+         return type == Pattern ? Pattern.compile(result) : result
+       }
+    }
+    
     
     static String urlToFileName(String url, String defaultExt) {
         String result = url.replaceAll('^.*/','')
@@ -1280,6 +1302,31 @@ class Utils {
     }
     
     @CompileStatic
+    static String safeJson(Object obj) {
+        JsonGenerator jsonGenerator = safeJsonGenerator()
+        return JsonOutput.prettyPrint(jsonGenerator.toJson(obj))
+    }
+    
+    @CompileStatic
+    static JsonGenerator safeJsonGenerator() {
+        JsonGenerator jsonGenerator =
+                new JsonGenerator.Options()
+                .addConverter(PipelineFile) { PipelineFile f ->
+                    f.absolutePath
+                }
+                .addConverter(PipelineInput) { PipelineInput i ->
+                    i.toString()
+                }
+                .addConverter(PipelineOutput) { PipelineOutput i ->
+                    i.toString()
+                }
+                .build()
+        return jsonGenerator
+    }
+
+    
+    
+    @CompileStatic
     public static Map configToMap(Map m) {
         if(m instanceof ConfigObject) {
             m = m.collectEntries { it }
@@ -1291,5 +1338,14 @@ class Utils {
             }
         }
         return m
+    }
+    
+    @CompileStatic
+    public static Throwable sanitizeForDisplay(Throwable e) {
+           e = StackTraceUtils.deepSanitize(e)
+           e.stackTrace = e.stackTrace.grep { StackTraceElement el ->
+               !el.className.startsWith('bpipe.')
+           } as StackTraceElement[]
+           return e
     }
 }

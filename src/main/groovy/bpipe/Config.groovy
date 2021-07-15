@@ -18,7 +18,7 @@ class Config {
 	 * Lower level configuration values.  These are not directly user 
 	 * exposed.
 	 */
-    static Map<String,Object> config = [
+    public static Map<String,Object> config = [
         
         // Environment to select, when multiple are availabe in a bpipe.config file
         environment: 'default',
@@ -98,7 +98,7 @@ class Config {
     /**
      * Configuration loaded from the local directory
      */
-    public static ConfigObject userConfig
+    public static Map userConfig
     
     /**
      * Return an element from the user config (bpipe.config) that is expected to be a List
@@ -156,7 +156,7 @@ class Config {
 			builtInConfigFile = new File(System.getProperty("bpipe.home") + "/src/main/config", "bpipe.config")
 		}
         
-        Map configFiles = [builtInConfig: builtInConfigFile]
+        Map<String,File> configFiles = [builtInConfig: builtInConfigFile]
         
         // The default way to prompt user for information is to ask at the console
         // Configuration in user home directory
@@ -196,7 +196,9 @@ class Config {
         
         Map<String,ConfigObject> configs
         GParsPool.withPool(configFiles.size()) {
-            configs = configFiles.collectParallel { name, file ->
+            configs = configFiles.grep { it.value.exists() }.collectParallel { e ->
+                def file = e.value
+                def name = e.key
                 Utils.time("Read config from $file") {
                     [name, slurper.parse(file.toURI().toURL())]
                 }
@@ -243,6 +245,18 @@ class Config {
            log.info "The following stages are configured to be ignored in diagrams: $noDiagramStages"
            Config.noDiagram.addAll(noDiagramStages)
        }
+    }
+    
+    public static void lockUserConfig() {
+        userConfig = userConfig.collectEntries {  k, v ->
+            if(v instanceof Map) {
+                [k,v.asUnmodifiable()]
+            }
+            else {
+                [k,v]
+            }
+        }
+        userConfig = userConfig.asUnmodifiable()
     }
     
     /**

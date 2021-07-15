@@ -1,10 +1,22 @@
 package bpipe
 
 import java.util.logging.Level;
-
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+import groovy.transform.CompileStatic
 import groovy.util.logging.Log;
 
 
+/**
+ * Tracks occurrence of an undefined variable exception inside bpipe stages
+ * 
+ * This is needed because due to some of bpipe's dynamic behavior, variables can
+ * be resolved lazily. However that means that real undefined variables need to be accepted
+ * at certain points, which can make it very confusing and the original location where they
+ * occurred is lost. This class allows the exceptions to be captured and kept until it is 
+ * determined the variable does not match anything that is resolved lazily, then the original
+ * exception can be thrown after the fact.
+ */
 class ImplicitVariable {
     String name
     MissingPropertyException exception
@@ -26,12 +38,8 @@ class PipelineDelegate {
         this.context.set(ctx)
     }
     
-    ThreadLocal<PipelineContext> context = new ThreadLocal<PipelineContext>() {
-        void set(PipelineContext c) {
-            super.set(c)
-        }
-    }
-    
+    ThreadLocal<PipelineContext> context = new ThreadLocal<PipelineContext>()     
+
     static void setDelegateOn(PipelineContext context, Closure body) {
         
         // Note we must synchronize on the inner body, not outer as 
@@ -189,6 +197,11 @@ class PipelineDelegate {
         }
     }
     
+    final static Pattern OUTPUT_WITH_NUMBER_PATTERN = ~"output([0-9]{1,})\$"
+
+    final static Pattern INPUT_WITH_NUMBER_PATTERN = ~"input([0-9]{1,})\$"
+    
+    @CompileStatic
     def propertyMissing(String name) {
         
         // The context can be put into a mode where missing variables should echo themselves back
@@ -198,7 +211,11 @@ class PipelineDelegate {
         if(log.isLoggable(Level.FINE))
             log.fine "Query for $name on ${context.get()} via delegate ${this} in thread ${Thread.currentThread().id}"
         
+        
         PipelineContext ctx = context.get()
+        
+        Matcher outputNameWithNumberMatch
+        Matcher inputNameWithNumberMatch
         
         if(ctx.hasProperty(name)) {
             return ctx.getProperty(name)
@@ -216,18 +233,17 @@ class PipelineDelegate {
             return ctx.branch.getProperty(name)
         } 
         else
-        if(name.matches("output[0-9]{1,}\$")) {
-            // extract output number
-            int n = (name =~ "output([0-9]{1,})\$")[0][1].toInteger()
-            log.info "Output $n reference resolved by PipelineDelegate"
-            return context.get().invokeMethod("getOutputByIndex", [n-1] as Object[])
+        if((outputNameWithNumberMatch = OUTPUT_WITH_NUMBER_PATTERN.matcher(name)).matches()) {
+            int n = outputNameWithNumberMatch.group(1).toInteger()
+            log.fine "Output $n reference resolved by PipelineDelegate"
+            return context.get().getOutputByIndex(n-1)
         }
         else
-        if(name.matches("input[0-9]{1,}\$")) {
+        if((inputNameWithNumberMatch = INPUT_WITH_NUMBER_PATTERN.matcher(name)).matches()) {
             // extract input number
-            int n = (name =~ "input([0-9]{1,})\$")[0][1].toInteger()
-            log.info "Input $n reference resolved by PipelineDelegate"
-            return context.get().invokeMethod("getInputByIndex", [n-1] as Object[])
+            int n = inputNameWithNumberMatch.group(1).toInteger()
+            log.fine "Input $n reference resolved by PipelineDelegate"
+            return context.get().getInputByIndex(n-1)
         }
         else
         if(Runner.binding.variables.containsKey(name)) {
@@ -244,7 +260,10 @@ class PipelineDelegate {
                 return result
             }
             catch(MissingPropertyException t) {
-                ctx.implicitVariables << new ImplicitVariable(name:name, exception:t)
+                ctx.implicitVariables << new ImplicitVariable(
+                    name:name, 
+                    exception: new MissingPropertyException("No such property: $name in stage $ctx.stageName")
+                )
                 return '$'+name
             }
         }

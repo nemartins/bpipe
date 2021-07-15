@@ -3,9 +3,8 @@ package bpipe
 import groovy.json.JsonGenerator
 import groovy.json.JsonOutput
 import groovy.text.Template
+import groovy.transform.CompileStatic
 import groovy.util.logging.Log;
-
-import java.util.Map;
 
 /**
  * A dummy notification channel that just saves files in a "notifications" folder
@@ -13,15 +12,16 @@ import java.util.Map;
  * @author simon.sadedin@mcri.edu.au
  */
 @Log
+@CompileStatic
 class FileNotificationChannel implements NotificationChannel {
     
-    ConfigObject cfg
+    Map cfg
     
     File dir = new File("notifications")
     
     int count = 1
 
-    public FileNotificationChannel(ConfigObject cfg) {
+    public FileNotificationChannel(Map cfg) {
         this.cfg = cfg
     }
 
@@ -34,7 +34,7 @@ class FileNotificationChannel implements NotificationChannel {
         File targetFile = new File(dir, "${count}_${event.name()}.txt")
         if(event == PipelineEvent.SEND) {
             if(model.containsKey("send.file") && model["send.file"] != null && this.cfg.get('customTarget',true)) 
-                targetFile = new File(model["send.file"])
+                targetFile = new File(String.valueOf(model["send.file"]))
                 
             modelContentToFile(model, targetFile)
 
@@ -51,43 +51,24 @@ class FileNotificationChannel implements NotificationChannel {
     }
 
     static void modelContentToFile(final Map model, final File targetFile) {
-        if(model["send.contentType"] == "application/json") {
-
-            JsonGenerator jsonGenerator = safeJsonGenerator()
-
-            Object content = model["send.content"]
-            String json = jsonGenerator.toJson(content)
-
-            targetFile.text = JsonOutput.prettyPrint(json) + '\n'
+        targetFile.absoluteFile.parentFile.mkdirs()
+        def content = model["send.content"]
+        boolean isJson = (model["send.contentType"] == "application/json")
+        if(content instanceof String) {
+            targetFile.text = isJson ? ((String)content + '\n') : content
         }
         else
-        if(model["send.content"] instanceof String) {
-            targetFile.text = model["send.content"]
+        if(isJson) {
+           String json = Utils.safeJson(content)
+           targetFile.text = json + '\n'
         }
         else
-        if(model["send.content"] instanceof File)
-            targetFile << model["send.content"].bytes
-    }
-
-    static JsonGenerator safeJsonGenerator() {
-        JsonGenerator jsonGenerator =
-                new JsonGenerator.Options()
-                .addConverter(PipelineFile) { PipelineFile f ->
-                    f.absolutePath
-                }
-                .addConverter(PipelineInput) { PipelineInput i ->
-                    i.toString()
-                }
-                .addConverter(PipelineOutput) { PipelineOutput i ->
-                    i.toString()
-                }
-                .build()
-        return jsonGenerator
+        if(content instanceof File)
+            targetFile << ((File)model["send.content"]).bytes
     }
 
     @Override
     public String getDefaultTemplate(String contentType) {
         "file.template.txt"
     }
-
 }

@@ -31,13 +31,20 @@ import org.codehaus.groovy.runtime.StackTraceUtils
 
 import groovy.text.SimpleTemplateEngine
 import groovy.transform.CompileStatic
-import groovy.util.ConfigObject;
 import groovy.util.logging.Log;
 
 @CompileStatic
 class NotificationChannelReference {
     String channelName
-    ConfigObject channel
+    Map channel
+}
+
+@CompileStatic
+class FatalMessagingError extends PipelineError {
+
+    public FatalMessagingError(String msg) {
+        super(msg);
+    }
 }
 
 /**
@@ -50,7 +57,7 @@ class NotificationChannelReference {
 @Singleton
 class NotificationManager {
     
-    ConfigObject cfg
+    Map cfg
 	
 	/**
 	 * Time at which a message was last sent for each category of message
@@ -61,7 +68,13 @@ class NotificationManager {
     /**
      * Configured notification channels
      */
-    Map<String,ConfigObject> channels = Collections.synchronizedMap([:])
+    Map<String,Map> channels = Collections.synchronizedMap([:])
+    
+    /**
+     * If one or more notification channels fails with a fatal error, 
+     * it will be set here and reported as a pipeline error
+     */
+    Exception fatalError
     
     /**
      * Configure this notification manager with the given configuration object
@@ -71,7 +84,7 @@ class NotificationManager {
      * 
      * @param obj    configuration
      */
-    void configure(ConfigObject obj) {
+    void configure(Map obj) {
         
         log.info "Configuring notifications based on : " + obj.notifications
         
@@ -83,13 +96,13 @@ class NotificationManager {
             cfg.notifications.file.customTarget=false
         }
             
-        cfg.notifications.each { String name, ConfigObject channelCfg -> 
+        cfg.notifications.each { String name, Map channelCfg -> 
             configureChannel(name, channelCfg)
         }
     }
     
     @CompileStatic
-    void configureChannel(String name, ConfigObject channelCfg) {
+    void configureChannel(String name, Map channelCfg) {
 
         channelCfg.type = channelCfg.type?:name
 
@@ -102,6 +115,8 @@ class NotificationManager {
         } catch (Exception e) {
             String msg ="ERROR: Unable to create connection to notification channel $name (error: ${StackTraceUtils.sanitizeRootCause(e)}) - see bpipe log for full stack trace."
             System.err.println(msg)
+            if(channelCfg.getOrDefault('required', false))
+                fatalError = e
             return
         }
 
@@ -109,7 +124,7 @@ class NotificationManager {
     }
 
     @CompileStatic
-    private void configureChannelEvents(ConfigObject channelCfg, String name, NotificationChannel channel) {
+    private void configureChannelEvents(Map channelCfg, String name, NotificationChannel channel) {
         List<PipelineEvent> eventFilter = [PipelineEvent.FINISHED]
         if(channelCfg.containsKey('events'))  {
             try {
@@ -139,7 +154,7 @@ class NotificationManager {
     
     @CompileStatic
     void setChannelVariables(Binding binding) {
-        this.channels.each { String name, ConfigObject c ->
+        this.channels.each { String name, Map c ->
             log.info "Binding channel variable $name"
             binding.setVariable(name, new NotificationChannelReference(channelName:name, channel:c))
         }
@@ -162,16 +177,16 @@ class NotificationManager {
         }
         
         // Find the correct configuration
-        sendNotification((ConfigObject)this.cfg.notifications[channelName], evt, desc, detail)
+        sendNotification((Map)this.cfg.notifications[channelName], evt, desc, detail)
     }
     
 	/**
 	 * Send the given notification, subject to constraints on sends that are configured for
 	 * the channel
 	 */
-	void sendNotification(ConfigObject cfg, PipelineEvent evt, String desc, Map detail) {
+	void sendNotification(Map cfg, PipelineEvent evt, String desc, Map detail) {
         
-        def sanitisedCfg = cfg.collectEntries { [it.key, it.key.contains('password') ? '******' : it.value] }
+        def sanitisedCfg = cfg.collectEntries { [it.key, (it.key.contains('password') || it.key.contains('token')) ? '******' : it.value] }
         
         log.info "Sending to channel $sanitisedCfg"
         
@@ -183,7 +198,7 @@ class NotificationManager {
             throw new PipelineError("Notification channel $cfg.name is not configured. Please check the log files to see why this channel did not set up correctly")
         }
         
-        if(cfg.channel instanceof ConfigObject)
+        if(cfg.channel instanceof Map)
             throw new PipelineError("Notification channel $cfg.name is not configured properly. Please check the log files to see why this channel did not set up correctly")
         
         NotificationChannel channel = cfg.channel
@@ -281,13 +296,23 @@ class NotificationManager {
 		}
 		catch(Throwable t) {
 			log.warning("Failed to send notification via channel "+ channel + " with using template file $templateFile?.absolutePath,configuration " + cfg + ": " + t)
-            log.log(Level.SEVERE, "Failed to send notification to channel $channel using template $templateFile, coniguration $cfg", t)
-            String msg =  "MSG: unable to send notification to channel $channel due to $t"
+            log.log(Level.SEVERE, "Failed to send notification to channel $cfg.name using template $templateFile, coniguration $cfg", t)
+            
+            String stagePart = detail.containsKey('stage') ? " Stage ${detail.stage.stageName} " : ""
+            String branchPart = (detail.containsKey('send.branch') && detail['send.branch']) ? " in branch ${detail.'send.branch'} " : ""
+            
+            String msg =  "MSG: ${stagePart}${branchPart}unable to send notification to channel $cfg.name due to $t"
             handleError(cfg, msg)
+            if(t instanceof FatalMessagingError) {
+                Pipeline pipeline = Pipeline.rootPipeline
+                pipeline.failExceptions << t
+                pipeline.failed = true
+                pipeline.failReason = pipeline.failReason ? "$pipeline.failReason\n\n$msg" :  msg
+            }
 		}
 	}
 
-    private void handleError(ConfigObject config, String msg) {
+    private void handleError(Map config, String msg) {
         if(config.getOrDefault('terminateOnError',false)) {
             throw new PipelineError(msg)
         }
@@ -311,7 +336,7 @@ class NotificationManager {
      * @param channelCfg
      * @return    {@link NotificationChannel} instance ready to send notifications
      */
-   NotificationChannel createChannel(ConfigObject channelCfg) {
+   NotificationChannel createChannel(Map channelCfg) {
        String clazz = channelCfg.type
        
        // Try and be a little bit more flexible with how things are specified
@@ -326,7 +351,7 @@ class NotificationManager {
        for(String fullClazz in [clazz, "bpipe."+clazz.toUpperCase()+"NotificationChannel", "bpipe." + clazz, "bpipe."+upperFirst+"NotificationChannel"]) {
            try {
                log.info "Trying class name $fullClazz for notification channel $clazz"
-               Class<ConfigObject> [] args = [ ConfigObject.class ] as Class[]
+               Class<Map> [] args = [ Map.class ] as Class[]
                Constructor c = Class.forName(fullClazz).getConstructor(args)
                NotificationChannel nc = c.newInstance( [ channelCfg ] as Object[] )
                log.info "Successfully created notification channel using class $fullClazz"
@@ -363,5 +388,10 @@ class NotificationManager {
            else
                log.info("Channel $id does not support close")
        }
+   }
+   
+   @CompileStatic
+   static NotificationManager getTheInstance() {
+       return NotificationManager.instance
    }
 }

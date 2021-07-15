@@ -92,7 +92,7 @@ public class Pipeline implements ResourceRequestor {
     /**
      * Default imports added to the top of all files executed by Bpipe
      */
-    static final String PIPELINE_IMPORTS = "import static Bpipe.*; import static bpipe.RegionSet.bed; import Preserve as preserve; import Intermediate as intermediate; import Accompanies as accompanies; import Produce as produce; import Transform as transform; import Filter as filter;"
+    static final String PIPELINE_IMPORTS = "import static Bpipe.*; import static bpipe.RegionSet.bed; import static bpipe.Pipeline.filetype; import Preserve as preserve; import Intermediate as intermediate; import Accompanies as accompanies; import Produce as produce; import Transform as transform; import Filter as filter;"
     
     /**
      * The thread id of the master thread that is running the baseline root
@@ -137,6 +137,7 @@ public class Pipeline implements ResourceRequestor {
      */
     Map<String,String> variables = [:]
     
+   
     /**
      * File name mappings belonging to this pipeline instance
      */
@@ -266,13 +267,13 @@ public class Pipeline implements ResourceRequestor {
     /**
      * If a pipeline failed with an exception, it sets the exception(s) here
      */
-    List<Throwable> failExceptions = []
+    List<Throwable> failExceptions = Collections.synchronizedList([])
     
     /**
      * If a pipeline fails but not with an exception, the reason, if known
      * is set here
      */
-    String failReason = "Unknown"
+    String failReason
     
     /**
      * The base context from which all others are generated
@@ -549,6 +550,7 @@ public class Pipeline implements ResourceRequestor {
             ExecutorPool.startPools(ExecutorFactory.instance, Config.userConfig, false, true) 
         }  
         
+       
         log.info("Running with INPUT " + inputFile)
         
         initResourceUnitMetaClass()
@@ -575,6 +577,8 @@ public class Pipeline implements ResourceRequestor {
             PipelineCategory.addStages(pipelineBuilder.binding)
             
         ToolDatabase.instance.setToolVariables(pipeline.externalBinding)
+        
+        Config.lockUserConfig()
         
         NotificationManager.instance.setChannelVariables(pipeline.externalBinding)
         
@@ -834,7 +838,7 @@ public class Pipeline implements ResourceRequestor {
             runSegment(resolvedInputFiles, constructedPipeline)
                     
             if(failed) {
-                failureMessage = ("\n" + failExceptions*.message.join("\n"))
+                failureMessage = summarizeExceptions(failExceptions)
             }
         }
         catch(PatternInputMissingError e) {
@@ -880,6 +884,19 @@ public class Pipeline implements ResourceRequestor {
         }
     }
     
+    @CompileStatic
+    String summarizeExceptions(List<Throwable> failExceptions) {
+        return '\n' + failExceptions.collect { e ->
+            if(e instanceof PipelineError && ((PipelineError)e).ctx) {
+                PipelineError pe = (PipelineError)e
+                String branchPart = pe.ctx?.branch?.name ? " ($pe.ctx.branch.name) " : ""
+                return "In stage ${pe.ctx?.stageName}$branchPart: " + pe.message
+            }
+            else 
+                return e.message
+        }.join('\n')
+    }
+    
     private void clearMissingFilePromptText() {
         new File(".bpipe/prompt_input_files." + Config.config.pid).text = ''
     }
@@ -910,7 +927,7 @@ public class Pipeline implements ResourceRequestor {
      * Send the event signalling that the pipeline has completed
      */
     private void sendFinishedEvent(Date startDate, List allChecks) {
-        log.info "Sending FINISHED event"
+        log.info "Sending FINISHED event for $startDate - $finishDate"
 
         EventManager.instance.signal(PipelineEvent.FINISHED, "Pipeline " + (failed?"Failed":"Succeeded"),
                 [
@@ -952,7 +969,7 @@ public class Pipeline implements ResourceRequestor {
     private final static int STATS_POLLER_INTERVAL = 120000
     
     private scheduleStatsUpdate() {
-        long intervalMs = Config.userConfig.get('stats_update_interval', STATS_POLLER_INTERVAL)
+        long intervalMs = Config.userConfig.getOrDefault('stats_update_interval', STATS_POLLER_INTERVAL)
         
         Poller.instance.executor.scheduleAtFixedRate({
             try {
@@ -1030,9 +1047,18 @@ public class Pipeline implements ResourceRequestor {
         String startDateTime = cal.format("yyyy-MM-dd HH:mm") + " "
 
         OutputLog startLog = new OutputLog("----")
-        startLog.bufferLine("="*Config.config.columns)
-        startLog.bufferLine("|" + " Starting Pipeline at $startDateTime".center(Config.config.columns-2) + "|")
-        startLog.bufferLine("="*Config.config.columns)
+        startLog.bufferLine("╒" + "═"*(Config.config.columns-2) + '╕')
+        
+        if(documentation?.title) {
+            startLog.bufferLine("|" + " " * (Config.config.columns-2) + "|")
+            startLog.bufferLine("| " + documentation.title.center(Config.config.columns-3) + "|")
+            startLog.bufferLine("|" + " " * (Config.config.columns-2) + "|")
+            startLog.bufferLine("|" + " Starting at $startDateTime".center(Config.config.columns-2) + "|")
+        }
+        else {
+            startLog.bufferLine("|" + " Starting Pipeline at $startDateTime".center(Config.config.columns-2) + "|")
+        }
+        startLog.bufferLine("╘" + "═"*(Config.config.columns-2) + '╛')
         startLog.flush()
     }
     
@@ -1188,10 +1214,9 @@ public class Pipeline implements ResourceRequestor {
                     String scriptClassName = scriptFile.name.replaceAll('.groovy$','_bpipe.groovy')
                     String scriptText = scriptFile.text
                     if(scriptText.startsWith('#!')) {
-                        println "Stripping shebang"
                        scriptText = scriptText.substring(scriptText.indexOf('\n')+1) 
                     }
-
+                    
                     Script script = shell.evaluate(PIPELINE_IMPORTS+
                         (includesLibs?" binding.variables['BPIPE_NO_EXTERNAL_STAGES']=true;":"") +
                         "bpipe.Pipeline.scriptNames['$scriptFile']=this.class.name;" +
@@ -1294,6 +1319,18 @@ public class Pipeline implements ResourceRequestor {
         }
             
         loadedPaths << f
+    }
+    
+    /**
+     * Map of custom file types (extension => list of mappings)
+     */
+    static Map<String,List<String>> fileTypeMappings = Collections.synchronizedMap([:])
+
+    static synchronized void filetype(Map<String,List<String>> mappings) {
+        mappings.each { 
+            log.info "Registered custom file type $it.key => $it.value"
+            fileTypeMappings[it.key]=it.value 
+        }
     }
     
     static synchronized void config(Closure cfgClosure) {

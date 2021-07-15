@@ -29,6 +29,7 @@ import java.util.logging.Level
 import bpipe.storage.LocalPipelineFile
 import bpipe.storage.UnknownStoragePipelineFile
 import groovy.json.JsonOutput
+import groovy.transform.CompileStatic
 import groovy.util.logging.Log;
 import groovy.xml.MarkupBuilder
 
@@ -43,6 +44,10 @@ import groovy.xml.MarkupBuilder
 @Log
 class Sender {
     
+    final static File SENT_FOLDER = new File(".bpipe/sent/")
+
+    final static File PENDING_SEND_FOLDER = new File(".bpipe/sent/pending")
+
     PipelineContext ctx
     
     String contentType
@@ -79,6 +84,7 @@ class Sender {
         return this
     }
     
+    @CompileStatic
     Sender json(Closure c) {
         Object result = c()
         if(result instanceof PipelineInput) {
@@ -88,10 +94,11 @@ class Sender {
         // If it is a file object, send the content of the file, not the literal file object
         if(result instanceof File) {
             log.info "Sent JSON resolves to file: sending content of file $result"
-            this.content = result.text
+            this.content = ((File)result).text
         }
-        else
-            this.content = JsonOutput.toJson(result)
+        else {
+            this.content = Utils.safeJson(result)
+        }
             
         this.contentType = "application/json"
         this.defaultSubject = "JSON content from stage ${ctx.stageName}"
@@ -254,14 +261,16 @@ class Sender {
             "send.content": content,
             "send.subject": this.details.subject,
             "send.contentType" : this.contentType,
-            "send.file" : this.details.file
+            "send.file" : this.details.file,
+            "send.branch" : ctx.branch.name 
         ]
         
         if('url' in details) {
             props["send.url"] = details.url
         }
         
-       FileNotificationChannel.modelContentToFile(props, sentFile)
+       File tempSentFile = new File(PENDING_SEND_FOLDER, sentFile.name)
+       FileNotificationChannel.modelContentToFile(props, tempSentFile)
 
         if('properties' in details) {
            details.properties.each { k,v ->
@@ -285,6 +294,8 @@ class Sender {
        else {
            NotificationManager.instance.sendNotification(cfgName, PipelineEvent.SEND, this.details.subject, props) 
        }
+       
+       tempSentFile.renameTo(sentFile)
        
        EventManager.instance.signal(PipelineEvent.SEND, this.details.subject, props)
        
@@ -310,10 +321,9 @@ class Sender {
      */
     private File determineSentFile(final String cfgName) {
        Pipeline pipeline = Pipeline.currentRuntimePipeline.get()
-       File sentFolder = new File(".bpipe/sent/")
-       sentFolder.mkdirs()
+       SENT_FOLDER.mkdirs()
        
-       File legacySentFile = new File(sentFolder, cfgName + "." + ctx.stageName + "." + Utils.sha1(this.details.subject + content))
+       File legacySentFile = new File(SENT_FOLDER, cfgName + "." + ctx.stageName + "." + Utils.sha1(this.details.subject + content))
        File sentFile
        if(legacySentFile.exists()) {
            log.info "Found legacy sent file for $ctx.stageName/$details.subject: not re-sending" 
@@ -325,7 +335,7 @@ class Sender {
            if(details.file) {
                sha1Subject = sha1Subject + ':'+details.file.toString()
            }
-           sentFile = new File(sentFolder, cfgName + "." + ctx.stageName + "." + Utils.sha1(sha1Subject))
+           sentFile = new File(SENT_FOLDER, cfgName + "." + ctx.stageName + "." + Utils.sha1(sha1Subject))
            log.info "Using new style sent file $sentFile"
        }
        return sentFile

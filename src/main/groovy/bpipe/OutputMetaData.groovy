@@ -130,7 +130,7 @@ class OutputMetaData implements Serializable {
      */
     StorageLayer storage
     
-    private OutputMetaData() {
+    OutputMetaData() {
     }
     
     OutputMetaData(PipelineFile outputFile) {
@@ -373,7 +373,7 @@ class OutputMetaData implements Serializable {
         if(outputPath.startsWith("./"))
             outputPath = outputPath.substring(2)
         
-        int maxFileNameLength = Config.userConfig.get('maxFileNameLength',2048)
+        int maxFileNameLength = Config.userConfig.getOrDefault('maxFileNameLength',2048)
         String pathElement = outputPath.replace('/', "_").replace('\\','_')
         String fileName = this.stageName + "." + pathElement + ".properties"
         if(fileName.size() > maxFileNameLength)
@@ -428,7 +428,7 @@ class OutputMetaData implements Serializable {
         if(!this.inputs.contains(inputProps.outputPath)) // Not an input used to produce this output
             return false
 
-        log.info "Checking timestamp of $outputFile vs input $inputProps.outputPath"
+        log.fine "Checking timestamp of $outputFile vs input $inputProps.outputPath"
         if(inputProps?.maxTimestamp < this.timestamp) { // inputs unambiguously older than output
             return false
         }

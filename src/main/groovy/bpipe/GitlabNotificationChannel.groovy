@@ -25,7 +25,6 @@
  */
 package bpipe
 
-import java.util.Map
 import java.util.regex.Pattern
 
 import org.gitlab4j.api.GitLabApi
@@ -38,6 +37,7 @@ import groovy.transform.CompileStatic
 import groovy.util.logging.Log
 import org.gitlab4j.api.models.*
 
+@CompileStatic
 class GitlabFileReference {
     FileUpload upload
     String path
@@ -47,10 +47,18 @@ class GitlabFileReference {
     }
 }
 
+@CompileStatic
+class NonuniqueGitlabIssue extends FatalMessagingError {
+
+    public NonuniqueGitlabIssue(String msg) {
+        super(msg);
+    }
+}
+
 @Log
 class GitlabNotificationChannel implements NotificationChannel {
     
-    ConfigObject cfg
+    Map cfg
     
 	GitLabApi gitlab 
     
@@ -58,15 +66,27 @@ class GitlabNotificationChannel implements NotificationChannel {
 	
 	String baseURL
     
-    public GitlabNotificationChannel(ConfigObject cfg) {
+    public GitlabNotificationChannel(Map cfg) {
         this.cfg = cfg
         log.info "Connecting to gitlab at $cfg.url using token"
         gitlab = new GitLabApi(cfg.url, cfg.token)
         
 		log.info "Notification channel $cfg.name connected to gitlab successfully"
-        project = gitlab.projectApi.getProjects(cfg.project).find { Project p -> p.name == cfg.project }
+
+        if(cfg.project instanceof Number) {
+            project = gitlab.projectApi.getProject((int)cfg.project)
+        }
+        else
+        if(cfg.project instanceof String) {
+            project = gitlab.projectApi.projects.find { p -> 
+                   p.name == cfg.project 
+            }            
+        }
+        else
+            throw new IllegalArgumentException("Gitlab project must be specified by either string (name) or id (integer) but you provided a value of type ${cfg.project.class.name}")
         
 		log.info "Found project $project.name from Gitlab at $cfg.url"
+
 		this.baseURL = "$cfg.url/api/v4"
     }
 
@@ -92,6 +112,9 @@ class GitlabNotificationChannel implements NotificationChannel {
  	
         if(this.updateExistingIssue(issueDetails))
             return
+            
+        if(issueDetails.required)
+            throw new FatalMessagingError("Unable to locate required issue matching $issueDetails.title on channel $cfg.name")
             
         if(issueDetails.title instanceof Map) {
             log.info "Could not identify issue matching $issueDetails.title: issue will not be updated"
@@ -158,6 +181,9 @@ class GitlabNotificationChannel implements NotificationChannel {
 			if(searchResult.isEmpty()) {
                 return false
 			}
+            
+            if(searchResult.size()>1 && issueDetails.unique) 
+                throw new NonuniqueGitlabIssue("Search for $issueDetails.title in project $project.id yielded multiple results when configured with a unique constraint")
              
             issueId = searchResult[0].iid
             log.info "Found issue $issueId corresonding to title $issueDetails.title in project $project.id"
@@ -166,6 +192,9 @@ class GitlabNotificationChannel implements NotificationChannel {
     		notesApi.createIssueNote(project.id, issueId , issueDetails.description)
             return true
 		}
+        catch(NonuniqueGitlabIssue ngi) {
+            throw ngi
+        }
 		catch(PipelineError e) {
 			log.info "No issue found corresonding to title $issueDetails.title in project $project.id: treating as new issue"
             return false

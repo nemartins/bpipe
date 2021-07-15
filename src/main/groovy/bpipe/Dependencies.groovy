@@ -83,6 +83,7 @@ class Dependencies {
      * @return  true iff file is newer than all inputs, but older than all 
      *          non-up-to-date outputs
      */
+    @CompileStatic
     List<Path> getOutOfDate(List<PipelineFile> originalOutputs, List<PipelineFile> inputs) {
         
         List<PipelineFile> outputs = originalOutputs.unique(false)
@@ -114,7 +115,11 @@ class Dependencies {
         // If the outputs are created from nothing (no inputs)
         // then they are up to date as long as they exist
         if(!inputs)  {
-            outOfDateOutputs.addAll(outputs.collect { it instanceof PipelineFile ? it : new LocalPipelineFile(it) }.grep { !it.exists() }*.toPath())
+            def ood = 
+                outputs.collect { it instanceof PipelineFile ? it : new LocalPipelineFile(String.valueOf(it)) }
+                       .grep { PipelineFile pf -> !pf.exists() }*.toPath()
+
+            outOfDateOutputs.addAll(ood)
             return outOfDateOutputs
         }
             
@@ -128,8 +133,9 @@ class Dependencies {
         }
         else
         if(older.any { Files.exists(it) }) { // If any of the older files exist then we have no choice but to rebuild them
-            log.info "Not up to date because these files exist and are older than inputs: " + older.grep { Files.exists(it) }
-            outOfDateOutputs.addAll(older.grep{ Files.exists(it)})
+            List olderFiles = older.grep { Path p -> Files.exists(p) }
+            log.info "Not up to date because these files exist and are older than inputs: " + olderFiles
+            outOfDateOutputs.addAll(olderFiles)
             return outOfDateOutputs
         }
         else {
@@ -236,7 +242,7 @@ class Dependencies {
 
     private List checkParallel(List filesToCheck, List missing, Closure checkInput) {
         log.info "Using parallelized file check for checking ${filesToCheck.size()} inputs ..."
-        int concurrency = Config.userConfig.get('outputScanConcurrency',5)
+        int concurrency = Config.userConfig.getOrDefault('outputScanConcurrency',5)
         missing = (List)GParsPool.withPool(concurrency) {
             filesToCheck.grepParallel(checkInput)
         }
@@ -584,6 +590,7 @@ class Dependencies {
      *                  
      * @return          the root node in the graph of outputs
      */
+    @CompileStatic
     GraphEntry computeOutputGraph(List<OutputMetaData> outputs, GraphEntry rootTree = null, GraphEntry topRoot=null, List handledOutputs=[], boolean computeUpToDate=true) {
         
         // Special case: no outputs at all
@@ -602,7 +609,7 @@ class Dependencies {
         // from the list of outputs and recursively do the same for each output we discovered, building
         // the whole graph from the original inputs through to the final outputs
         
-        List allInputs = Utils.time("Calculate unique inputs") { outputs*.inputs.flatten().unique() }
+        List allInputs = outputs*.inputs.flatten().unique() 
         Set allOutputs = outputs*.canonicalPath as Set
         
         // Find outputs with "external" inputs - these are the top layer of outputs which
@@ -620,9 +627,9 @@ class Dependencies {
         
         // find groups of outputs (ie. ones that belong in the same branch of the tree)
         // If there is no tree to attach to, make one
-        List entries = []
+        List<GraphEntry> entries = []
         Map<String,List> outputGroups = [:]
-        Map createdEntries = [:]
+        Map<String,GraphEntry> createdEntries = [:]
         if(rootTree == null) {
             rootTree = new GraphEntry()
             outputGroups = rootTree.groupOutputs(outputsWithExternalInputs)
@@ -671,9 +678,11 @@ class Dependencies {
                                      outputs*.outputFile.join('\n') + 
                                      "\n\nThis may indicate a circular dependency in your pipeline")
         
-//        log.info "There are ${outputGroups.size()} output groups: ${outputGroups.values()*.outputPath}"
-        log.info "There are ${outputGroups.size()} output groups"
-        log.info "Subtracting ${outputsWithExternalInputs.size()} remaining outputs from ${outputs.size()} total outputs"
+        if(outputGroups.size()>0)
+            log.info "There are ${outputGroups.size()} output groups"
+            
+        if(outputs.size()>0)
+            log.info "Subtracting ${outputsWithExternalInputs.size()} remaining outputs from ${outputs.size()} total outputs"
         
         Set outputsWithExternalInputsSet = outputsWithExternalInputs as Set
         
@@ -686,7 +695,7 @@ class Dependencies {
             computeOutputGraph(remainingOutputs, createdEntries[key], topRoot, handledOutputs)
 //          log.info "Handled outputs: " + handledOutputs*.outputPath + " Hashcode  " + handledOutputs.hashCode()
             remainingOutputs.removeAll(handledOutputs)
-            log.info "There are ${remainingOutputs.size()} remaining outputs"
+//            log.info "There are ${remainingOutputs.size()} remaining outputs"
         }
         
         if(!computeUpToDate)
@@ -701,17 +710,21 @@ class Dependencies {
         // Here 'leaf node' means a final output as opposed to something that is only used
         // as an intermediate step in calculating a final output.
         for(GraphEntry entry in entries) {
-            
-            List inputValues = entry.parents*.values.flatten().grep { it != null }
+           
+           if(entry.values.is(null))
+               continue
+
+           List<OutputMetaData> inputValues = [] 
+           for(GraphEntry parent in entry.parents) {
+               if(parent.values != null)
+                   inputValues.addAll(parent.values)
+           }
             
             for(OutputMetaData p in entry.values) {
                 
                 // No entry is up to date if one of its inputs is newer
                 log.info " $p.outputFile / entry ${entry.hashCode()} ".center(40,"-")
-//                log.info "Parents: " + entry.parents?.size()
-//                
-//                log.info "Values: " + entry.parents*.values
-//                
+                
                 List newerInputs = findNewerInputs(p, inputValues)
                 
                 if(newerInputs) {
@@ -742,7 +755,9 @@ class Dependencies {
                 log.info "Checking  " + entry.children*.values*.outputPath + " from " + entry.children.size() + " children"
                 if(entry.children) {
                     
-                    List<GraphEntry> outOfDateChildren = entry.children.grep { c -> c.values.grep { !it.upToDate }*.outputPath  }.flatten()
+                    List<GraphEntry> outOfDateChildren = (List<GraphEntry>)entry.children.findAll { c -> 
+                        c.values.findAll { !it.upToDate }*.outputPath  
+                    }.flatten()
                     
 //                    p.upToDate = entry.children.every { it.values*.upToDate.every() }
                     p.upToDate = outOfDateChildren.empty
@@ -759,8 +774,7 @@ class Dependencies {
             }
         }
         
-        log.info "Finished Output Graph".center(30,"=")
-        
+//        log.info "Finished Output Graph".center(30,"=")
         return rootTree
     }
     
@@ -774,7 +788,7 @@ class Dependencies {
      * @return
      */
     List<OutputMetaData> scanOutputFolder() {
-        int concurrency = Config.userConfig.get('outputScanConcurrency',5)
+        int concurrency = Config.userConfig.getOrDefault('outputScanConcurrency',5)
         List result = []
         Utils.time("Output folder scan (concurrency=$concurrency)") {
             

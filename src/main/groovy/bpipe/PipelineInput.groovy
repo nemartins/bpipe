@@ -135,6 +135,7 @@ class PipelineInput {
         return resolvedValue
     }
     
+    @CompileStatic
     String toString() {
         try {
             PipelineFile resolvedValue = getResolvedValue()
@@ -171,6 +172,17 @@ class PipelineInput {
 	String getPrefix() {
         return PipelineCategory.getPrefix(this.toString());
 	}
+    
+    @CompileStatic
+    String getSuffix() {
+        if(utilisedMappings.isEmpty())  {
+            String value = this.toString()
+            return value.substring(value.lastIndexOf('.'))
+        }
+        
+        PipelineFile firstValue = this.getResolvedValue()
+        return utilisedMappings.find { firstValue.path == it.key }.value
+    }
     
     /**
      * Support accessing inputs by index - allows the user to use the form
@@ -242,20 +254,11 @@ class PipelineInput {
     def split() {
         toString().split()
     }
-        
-    /**
-     * Search backwards through the inputs to the current stage and the outputs of
-     * previous stages to find the first output that ends with the extension specified
-     * for each of the given exts.
-     */
-    List<PipelineFile> resolveInputsEndingWith(def exts) {    
-        resolveInputsEndingWithPatterns(exts.collect { it.replace('.','\\.')+'$' }, exts)
-    }
-    
+
     List<PipelineFile> probe(def pattern) {
         if(pattern instanceof String)
-            pattern = pattern.replace('.','\\.')+'$' 
-        
+            pattern = pattern.replace('.','\\.')+'$'
+    
         // TODO: refactor the resolveInputsEndingWithPatterns method to not return a
         // list with [null] when there is no result
         List<PipelineFile> result = resolveInputsEndingWithPatterns([pattern], [pattern], false)
@@ -263,7 +266,29 @@ class PipelineInput {
             return []
         return result
     }
+
+    /**
+     * Search backwards through the inputs to the current stage and the outputs of
+     * previous stages to find the first output that ends with the extension specified
+     * for each of the given exts.
+     */
+    @CompileStatic
+    List<PipelineFile> resolveInputsEndingWith(final List<String> exts) {    
+        resolveInputsEndingWithPatterns(exts.collect { String ext -> ext.replace('.','\\.')+'$' }, exts)
+    }
     
+//    List<PipelineFile> probe(def pattern) {
+//        if(pattern instanceof String)
+//            pattern = pattern.replace('.','\\.')+'$' 
+//        
+//        // TODO: refactor the resolveInputsEndingWithPatterns method to not return a
+//        // list with [null] when there is no result
+//        List<PipelineFile> result = resolveInputsEndingWithPatterns([pattern], [pattern], false)
+//        if(result.size()==1 && result[0]  == null)
+//            return []
+//        return result
+//    }
+//    
     /**
      * Search the pipeline hierarchy backwards to find inputs matching the patterns specified 
      * in 'exts'.
@@ -275,19 +300,23 @@ class PipelineInput {
      * @param origs user friendly versions of the above to display in errors
      * @return  list of inputs matching given patterns
      */
+    @CompileStatic
     List<PipelineFile> resolveInputsEndingWithPatterns(def exts, def origs, failIfNotFound=true) {    
         
         def orig = exts
         synchronized(stages) {
-            
+
             List<List<PipelineFile>> reverseOutputs = computeOutputStack()
 	        
-            List missingExts = []
+            List<String> missingExts = []
 	        def filesWithExts = [Utils.box(exts),origs].transpose().collect { extsAndOrigs ->
-	            String pattern = extsAndOrigs[0]
-	            String origName = extsAndOrigs[1]
                 
-	            List<String> resolved = resolveInputFromExtension(pattern, origName, reverseOutputs)
+                List<String> extOrigPair = (List<String>) extsAndOrigs
+
+	            String pattern = extOrigPair[0]
+	            String origName = extOrigPair[1]
+                
+	            List<PipelineFile> resolved = resolveInputFromExtension(pattern, origName, reverseOutputs)
                 if(resolved == null)
                     missingExts << origName
                 return resolved
@@ -297,13 +326,43 @@ class PipelineInput {
 	            throw new InputMissingError("Unable to locate one or more specified inputs from pipeline with the following extension(s):\n\n" + missingExts*.padLeft(15," ").join("\n"))
 	            
 			log.info "Found files with exts $exts : $filesWithExts"
-	        return filesWithExts.flatten().unique()
+	        return (List<PipelineFile>)filesWithExts.flatten().unique()
         }
     }
     
+    /**
+     * When a user defined type mapping is used in resolving a pipeline input,
+     * the mapping is recorded here. This then can inform later manipulation of
+     * the input so that the mapping is taken into account
+     */
+    Map<String, String> utilisedMappings = [:]
     
     @CompileStatic
-    List<PipelineFile> resolveInputFromExtension(String regex, String origName, List<List<PipelineFile>> reverseOutputs) {
+    List<PipelineFile> resolveInputFromExtension(String pattern, String origName, List<List<PipelineFile>> reverseOutputs) {
+
+        String customExt = origName.tokenize('.')[-1]
+        if(customExt.endsWith('$'))
+            customExt = customExt[1..-1]
+
+        List<String> mappings = Pipeline.fileTypeMappings[customExt]
+        if(!mappings.is(null)) {
+            for(String ext in mappings) {
+                String newExt = origName.substring(0, origName.size() - customExt.size()) + ext + '$'
+                def result = resolveInputFromRawExtension(newExt, origName, reverseOutputs)
+                if(!result.is(null)) {
+                    for(r in result) {
+                        utilisedMappings[r.path] =  ext
+                    }
+                    return result
+                }
+            }
+        }
+        else
+            return resolveInputFromRawExtension(pattern, origName, reverseOutputs)
+    }
+
+    @CompileStatic
+    List<PipelineFile> resolveInputFromRawExtension(String regex, String origName, List<List<PipelineFile>> reverseOutputs) {
         
             Pattern wholeMatch = ~('(^|^.*/)' + regex + '$')
                 
@@ -368,7 +427,7 @@ class PipelineInput {
                     throw new PipelineError("Expected a directory as input, but no current input to this stage was a directory: \n" + Utils.box(input).join("\n"))
             }
             else {
-              def exts = this.extensionPrefix?[extensionPrefix+"."+name]:[name]
+              List<String> exts = this.extensionPrefix?[extensionPrefix+"."+name]:[name]
               resolved = resolveInputsEndingWith(exts)
               if(resolved.size() <= defaultValueIndex)
                   throw new PipelineError("Insufficient inputs: at least ${defaultValueIndex+1} inputs are expected with extension .${name} but only ${resolved.size()} are available")
@@ -377,13 +436,14 @@ class PipelineInput {
         		mapToCommandValue(resolved)
         }
         catch(InputMissingError e) {
-            log.info("No input resolved for property $name: returning child PipelineInput for possible double extension resolution")
+            log.fine("No input resolved for property $name: returning child PipelineInput for possible double extension resolution")
             resolved = this.resolvedInputs
             ime = e
         }
         
         PipelineInput childInp = new PipelineInput((List<PipelineFile>)resolved.collect{it} , stages, aliases)
         childInp.parent = this
+        childInp.utilisedMappings = this.utilisedMappings
         childInp.resolvedInputs = (List<PipelineFile>)resolved.collect { it }
         childInp.currentFilter = this.currentFilter
         childInp.extensionPrefix = this.extensionPrefix ? this.extensionPrefix+"."+name : name
@@ -398,8 +458,7 @@ class PipelineInput {
      * in the pipeline, and includes the original inputs as the last stage. This "stack" of inputs
      * provides an appropriate order for searching for inputs to a pipeline stage.
      */
-// Causes ClassCastException at line ~395
-//    @CompileStatic
+    @CompileStatic
     List<List<PipelineFile>> computeOutputStack() {
         
         List relatedThreads = [Thread.currentThread().id, Pipeline.rootThreadId]
@@ -462,7 +521,7 @@ class PipelineInput {
         // Add an initial stage that prioritises the inputs provided to or resolved
         // by this PipelineInput already. This way if the from() spec is used and matches 
         // then it will go with those rather than searching backwards for a previous match
-        for(List inps in inputInputs.reverse()) {
+        for(inps in inputInputs.reverse()) {
            if(inps) {
                log.info "Add input from PipelineInput resolution chain: " + inps
                reverseOutputs.add(0,inps) 

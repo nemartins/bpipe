@@ -197,7 +197,7 @@ class CustomCommandExecutor implements PersistentExecutor {
         File commandScriptFile = new File(commandScript)
         commandScriptFile.text = command.command
         commandScriptFile.setExecutable(true)
-        String shell = command.shell ? command.shell.join(' ') : 'bash'
+        String shell = command.shell ? command.shell.join(' ') : 'bash -e'
    
         if(config?.stdbuf) {
             env.COMMAND = 'stdbuf -o0 ' + commandScript + ' > .bpipe/commandtmp/'+command.id+'/'+command.id+'.out 2>  .bpipe/commandtmp/'+command.id+'/'+command.id+'.err'
@@ -243,6 +243,10 @@ class CustomCommandExecutor implements PersistentExecutor {
             
         if('custom_submit_options' in config)
             env.CUSTOM_SUBMIT_OPTS = String.valueOf(config.custom_submit_options)
+            
+        if('gpus' in config) {
+            env.GPUS = String.valueOf(config.gpus)
+        } 
   
         // modules since we may need to load modules before the command... - Simon Gladman (slugger70) 2014
         if(config?.modules) {
